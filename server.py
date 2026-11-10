@@ -7,6 +7,8 @@ Here Claude runs a tool loop over mock seller data and streams each step back as
 import json
 import os
 import pathlib
+import re
+import time
 import urllib.request
 import uuid
 from collections import Counter
@@ -14,20 +16,22 @@ from datetime import date, datetime, timedelta
 
 import anthropic
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 HERE = pathlib.Path(__file__).parent
 
-# Tiny .env loader (KEY=VALUE lines), avoids an extra dependency
+# Tiny .env loader (KEY=VALUE lines), avoids an extra dependency.
+# utf-8-sig drops the invisible BOM Windows Notepad can add; quotes around values are removed.
 if (HERE / ".env").exists():
-    for line in (HERE / ".env").read_text().splitlines():
+    for line in (HERE / ".env").read_text(encoding="utf-8-sig").splitlines():
         if "=" in line and not line.strip().startswith("#"):
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 MODEL = os.environ.get("KAM_MODEL", "claude-haiku-5-5")  # fast model for voice turns
+ACCESS_CODE = os.environ.get("ACCESS_CODE", "")  # set this before putting the app on a public link
 SYSTEM_PROMPT = (HERE / "prompt.md").read_text(encoding="utf-8")
 client = anthropic.Anthropic()
 
@@ -67,9 +71,6 @@ SELLER = {
         "search_impressions": {"last_month": 52000, "this_month": 44200},
     },
 }
-
-TODAY = date.today()
-
 
 def pct_change(before, after):
     """Percent change, or None when there is no 'before' to compare with."""
@@ -126,7 +127,8 @@ def diagnose(data=None):
             "suggested_actions": ["Compare prices with similar listings and test a lower price on top products"],
         })
 
-    # 3. Cancellations: extra orders cancelled because the rate went up
+    # 3. Cancellations: extra orders cancelled because the rate went up.
+    #    Not double counted with stock-outs: those are orders never placed; these were placed, then cancelled.
     rate_up = round((tm["cancellation_rate"] - lm["cancellation_rate"]) * 100, 1)
     if rate_up >= 1:
         reasons = d.get("cancellation_reasons", {})
@@ -185,26 +187,41 @@ def diagnose(data=None):
 
 
 def create_action_plan(session, actions):
-    tasks = []
-    for i, a in enumerate(actions, 1):
-        due = TODAY + timedelta(days=int(a.get("due_in_days", 3)))
-        tasks.append({"id": f"T{i}", "title": a["title"], "owner": a.get("owner", "Seller"),
-                      "due": due.strftime("%a %d %b"), "kpi": a.get("kpi", "")})
-    session["plan"]["tasks"] = tasks
-    return {"created": len(tasks), "tasks": tasks}
+    """Adds tasks to the plan. Calling it again adds more; a task with the same title is updated."""
+    if not actions:
+        raise ValueError("actions is empty: pass at least one task")
+    tasks = {t["title"].lower(): t for t in session["plan"].get("tasks", [])}
+    for a in actions:
+        days = int(a.get("due_in_days", 3))
+        if not 0 <= days <= 90:
+            raise ValueError(f"due_in_days must be between 0 and 90, got {days}")
+        tasks[a["title"].lower()] = {"title": a["title"], "owner": a.get("owner", "Seller"),
+                                     "due": (date.today() + timedelta(days=days)).strftime("%a %d %b"),
+                                     "kpi": a.get("kpi", "")}
+    session["plan"]["tasks"] = [{"id": f"T{n}", **t} for n, t in enumerate(tasks.values(), 1)]
+    return {"added": len(actions), "tasks": session["plan"]["tasks"]}
 
 
 def schedule_follow_up(session, days, kpis):
-    when = datetime.combine(TODAY + timedelta(days=int(days)), datetime.min.time()).replace(hour=11)
+    days = int(days)
+    if not 1 <= days <= 60:
+        raise ValueError(f"days must be between 1 and 60, got {days}")
+    when = datetime.combine(date.today() + timedelta(days=days), datetime.min.time()).replace(hour=11)
     session["plan"]["follow_up"] = {"when": when.strftime("%a %d %b, %I:%M %p"), "kpis": kpis}
     return {"booked": True, **session["plan"]["follow_up"]}
 
 
 def raise_restock_alert(session, sku_ids):
-    known = {s["sku"]: s for s in SELLER["detail"]["newly_oos_skus"]}
-    alerts = [{"sku": k, "name": known[k]["name"], "supplier": known[k]["supplier"]} for k in sku_ids if k in known]
-    session["plan"]["restock_alerts"] = alerts
-    return {"alerts_raised": len(alerts), "suppliers_notified": sorted({a["supplier"] for a in alerts}), "alerts": alerts, "unknown": [k for k in sku_ids if k not in known]}
+    """Alerts suppliers. Calling it again adds to the alerts already raised in this call."""
+    known = {s["sku"]: s for s in SELLER["detail"].get("newly_oos_skus", [])}
+    alerts = {a["sku"]: a for a in session["plan"].get("restock_alerts", [])}
+    for k in sku_ids:
+        if k in known:
+            alerts[k] = {"sku": k, "name": known[k]["name"], "supplier": known[k]["supplier"]}
+    session["plan"]["restock_alerts"] = list(alerts.values())
+    new = [alerts[k] for k in sku_ids if k in known]
+    return {"alerts_raised": len(new), "suppliers_notified": sorted({a["supplier"] for a in new}),
+            "alerts": new, "unknown": [k for k in sku_ids if k not in known]}
 
 
 TOOLS = [
@@ -214,12 +231,12 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "raise_restock_alert", "description": "Raise restock alerts to the seller's suppliers for specific out-of-stock SKUs.",
      "input_schema": {"type": "object", "properties": {"sku_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["sku_ids"]}},
-    {"name": "create_action_plan", "description": "Create the agreed action plan as tasks. Call only after the seller agrees. 2-4 tasks.",
+    {"name": "create_action_plan", "description": "Add the agreed tasks to the action plan. Call only after the seller agrees. Calling again adds tasks; it does not erase earlier ones.",
      "input_schema": {"type": "object", "properties": {"actions": {"type": "array", "items": {"type": "object", "properties": {
          "title": {"type": "string"}, "owner": {"type": "string", "description": "Seller, or KAM (you)"},
-         "due_in_days": {"type": "integer"}, "kpi": {"type": "string", "description": "measurable target"}},
+         "due_in_days": {"type": "integer", "description": "0 to 90"}, "kpi": {"type": "string", "description": "measurable target"}},
          "required": ["title", "owner", "due_in_days", "kpi"]}}}, "required": ["actions"]}},
-    {"name": "schedule_follow_up", "description": "Book a follow-up call to check KPIs.",
+    {"name": "schedule_follow_up", "description": "Book a follow-up call to check KPIs, 1 to 60 days from today.",
      "input_schema": {"type": "object", "properties": {"days": {"type": "integer"}, "kpis": {"type": "array", "items": {"type": "string"}}}, "required": ["days", "kpis"]}},
 ]
 
@@ -236,14 +253,23 @@ TOOL_FUNCS = {
 
 # ---------------------------------------------------------------- agent loop
 GREETING = "Hello, this is Kai, your account manager. How can I help you today?"
-# Spoken while the first tool of a turn runs, if Claude didn't say anything itself
+SORRY = "Sorry, I didn't catch that. Could you say it again?"
+# Spoken while the first tool of a turn runs, if Claude didn't say anything itself: (English, Hinglish)
 FILLERS = {
-    "get_seller_metrics": "Sure, let me pull up your account.",
-    "diagnose": "Sure, let me pull up your account.",
-    "raise_restock_alert": "On it, setting that up now.",
-    "create_action_plan": "On it, setting that up now.",
+    "get_seller_metrics": ("Sure, let me pull up your account.", "Ek second, aapka account dekhte hain."),
+    "diagnose": ("Sure, let me pull up your account.", "Ek second, aapka account dekhte hain."),
+    "raise_restock_alert": ("On it, setting that up now.", "Theek hai, abhi set kar dete hain."),
+    "create_action_plan": ("On it, setting that up now.", "Theek hai, abhi set kar dete hain."),
 }
+# Common Hindi words written in English letters; two or more means the seller is speaking Hinglish
+HINGLISH = {"hai", "hain", "kya", "kyun", "mera", "meri", "mere", "nahi", "nahin", "bhai", "kaise", "gaya", "gayi",
+            "hua", "karo", "karna", "haan", "ji", "aap", "aapka", "mujhe", "kuch", "bahut", "sab", "theek", "abhi"}
 SESSIONS = {}  # in-memory, single process; move to Redis if it ever runs multi-instance
+SESSION_IDLE_SECONDS = 2 * 60 * 60  # forget calls idle for 2 hours
+
+
+def is_hinglish(text):
+    return len(set(re.findall(r"[a-z]+", text.lower())) & HINGLISH) >= 2
 
 
 def agent_turn(session, user_text):
@@ -256,6 +282,11 @@ def agent_turn(session, user_text):
         session["messages"] += [{"role": "user", "content": "[call connected]"}, {"role": "assistant", "content": GREETING}]
         yield {"type": "reply", "text": GREETING, "plan": session["plan"]}
         return
+    if not user_text.strip():  # nothing heard: ask again without calling the model
+        yield {"type": "reply", "text": SORRY, "plan": session["plan"]}
+        return
+    hinglish = is_hinglish(user_text)
+    start = len(session["messages"])
     session["messages"].append({"role": "user", "content": user_text})
     spoke = False
     for _ in range(8):  # cap tool rounds per turn
@@ -265,11 +296,17 @@ def agent_turn(session, user_text):
         )
         session["messages"].append({"role": "assistant", "content": resp.content})
         text = " ".join(b.text for b in resp.content if b.type == "text").strip()
+        if resp.stop_reason in ("max_tokens", "refusal"):
+            # Cut off or declined: a half-finished tool call would break every later turn, so undo this turn.
+            del session["messages"][start:]
+            yield {"type": "reply", "text": SORRY, "plan": session["plan"]}
+            return
         if resp.stop_reason != "tool_use":
-            yield {"type": "reply", "text": text, "plan": session["plan"]}
+            yield {"type": "reply", "text": text or SORRY, "plan": session["plan"]}
             return
         if not text and not spoke:  # nothing said yet this turn: acknowledge so the seller isn't left in silence
-            text = FILLERS.get(next(b.name for b in resp.content if b.type == "tool_use"), "")
+            filler = FILLERS.get(next(b.name for b in resp.content if b.type == "tool_use"), ("", ""))
+            text = filler[1] if hinglish else filler[0]
         if text:
             spoke = True
             yield {"type": "say", "text": text}
@@ -301,15 +338,26 @@ def index():
     return FileResponse(HERE / "index.html")
 
 
+def allowed(code):
+    """If ACCESS_CODE is set, every API call must send it (the page reads it from ?code= in the link)."""
+    return not ACCESS_CODE or code == ACCESS_CODE
+
+
 @app.post("/chat")
-def chat(body: Chat):
+def chat(body: Chat, x_access_code: str = Header("")):
     """Streams one JSON object per line (NDJSON): session id first, then the events from agent_turn."""
+    if not allowed(x_access_code):
+        return Response(status_code=401)
+    now = time.time()
+    for old in [k for k, v in SESSIONS.items() if now - v["seen"] > SESSION_IDLE_SECONDS]:
+        del SESSIONS[old]
     sid = body.session_id or str(uuid.uuid4())
     session = SESSIONS.setdefault(sid, {"messages": [], "plan": {}})
+    session["seen"] = now
 
     def stream():
         n = len(session["messages"])
-        yield json.dumps({"type": "session", "session_id": sid}) + "\n"
+        yield json.dumps({"type": "session", "session_id": sid, "seller": SELLER["seller"]}) + "\n"
         try:
             for event in agent_turn(session, body.text[:2000]):
                 yield json.dumps(event) + "\n"
@@ -325,10 +373,12 @@ class TTS(BaseModel):
 
 
 @app.post("/tts")
-def tts(body: TTS):
+def tts(body: TTS, x_access_code: str = Header("")):
     """ElevenLabs if a key is set; otherwise 204 and the browser uses its own voice."""
+    if not allowed(x_access_code):
+        return Response(status_code=401)
     key = os.environ.get("ELEVENLABS_API_KEY")
-    if not key:
+    if not key or not body.text.strip():
         return Response(status_code=204)
     voice = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
     req = urllib.request.Request(
@@ -386,9 +436,20 @@ if __name__ == "__main__":
         r = TOOL_FUNCS["raise_restock_alert"](s, {"sku_ids": ["HD-101", "NOPE"]})
         assert r["alerts_raised"] == 1 and r["unknown"] == ["NOPE"] and r["suppliers_notified"] == ["Jaipur Textiles"]
         r = TOOL_FUNCS["create_action_plan"](s, {"actions": [{"title": "Restock", "owner": "Seller", "due_in_days": 7, "kpi": "OOS < 5"}]})
-        assert r["created"] == 1 and s["plan"]["tasks"][0]["due"] == (TODAY + timedelta(days=7)).strftime("%a %d %b")
+        assert r["added"] == 1 and s["plan"]["tasks"][0]["due"] == (date.today() + timedelta(days=7)).strftime("%a %d %b")
+        TOOL_FUNCS["create_action_plan"](s, {"actions": [{"title": "Low-stock alerts", "owner": "Seller", "due_in_days": 2, "kpi": "on"}]})
+        assert [t["title"] for t in s["plan"]["tasks"]] == ["Restock", "Low-stock alerts"]  # added, not replaced
+        TOOL_FUNCS["raise_restock_alert"](s, {"sku_ids": ["HD-107"]})
+        assert len(s["plan"]["restock_alerts"]) == 2  # added to the first alert
+        for bad in ({"days": -5, "kpis": []}, {"days": 365, "kpis": []}):
+            try:
+                TOOL_FUNCS["schedule_follow_up"](s, bad); raise AssertionError("bad follow-up accepted")
+            except ValueError:
+                pass
+        assert is_hinglish("Bhai mera sales bahut gir gaya hai") and not is_hinglish("My sales dropped, can you help?")
         r = TOOL_FUNCS["schedule_follow_up"](s, {"days": 7, "kpis": ["OOS < 5"]})
         assert r["booked"] and "11:00 AM" in s["plan"]["follow_up"]["when"]
         print("self-check OK:", d["headline"])
     else:
-        uvicorn.run(app, host="127.0.0.1", port=8000)
+        # Local by default. For a public deploy: HOST=0.0.0.0, PORT from the platform, and set ACCESS_CODE.
+        uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 8000)))
