@@ -2,10 +2,12 @@
 
 Browser does speech-to-text (Web Speech API) and sends text to /chat.
 Here Claude runs a tool loop over mock seller data and streams each step back as it happens.
+/tts turns the reply into speech.
 """
 import json
 import os
 import pathlib
+import urllib.request
 import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -13,7 +15,7 @@ from datetime import date, datetime, timedelta
 import anthropic
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 HERE = pathlib.Path(__file__).parent
@@ -255,6 +257,29 @@ def chat(body: Chat):
             yield json.dumps({"type": "error", "text": f"{type(e).__name__}: {e}"}) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+class TTS(BaseModel):
+    text: str
+
+
+@app.post("/tts")
+def tts(body: TTS):
+    """ElevenLabs if a key is set; otherwise 204 and the browser uses its own voice."""
+    key = os.environ.get("ELEVENLABS_API_KEY")
+    if not key:
+        return Response(status_code=204)
+    voice = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+    req = urllib.request.Request(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format=mp3_44100_128",
+        data=json.dumps({"text": body.text[:1500], "model_id": "eleven_flash_v2_5"}).encode(),
+        headers={"xi-api-key": key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return Response(r.read(), media_type="audio/mpeg")
+    except Exception:
+        return Response(status_code=204)  # fall back to browser voice
 
 
 if __name__ == "__main__":
