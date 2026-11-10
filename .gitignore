@@ -1,0 +1,17 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# local working files, not part of the deliverable
+CLAUDE.md
+PLAN.md
+.claude/
+*.docx
+
+# recordings are shared separately
+*.mp4
+*.mkv
