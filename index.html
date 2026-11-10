@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini AI Voice KAM</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --text:#e8eaf0; --muted:#8b93a7; --accent:#e40046; --ok:#2fbf71; --tool:#6aa8ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; } header small { color:var(--muted); }
+  main { display:grid; grid-template-columns: 1.2fr 1fr; gap:16px; padding:16px 24px; max-width:1300px; margin:auto; }
+  @media (max-width:860px){ main { grid-template-columns:1fr; padding:16px; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 12px; }
+  #controls { display:flex; align-items:center; gap:16px; margin-bottom:12px; }
+  #call { width:76px; height:76px; border-radius:50%; border:0; background:var(--ok); color:#fff; font-size:30px; cursor:pointer; flex:none; transition:transform .1s; }
+  #call.live { background:var(--accent); } #call:active { transform:scale(.95); }
+  #status { font-size:16px; } #status .sub { display:block; color:var(--muted); font-size:13px; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--muted); margin-right:8px; vertical-align:middle; }
+  .listening .dot { background:var(--accent); animation:pulse 1s infinite; }
+  .speaking .dot { background:var(--ok); animation:pulse .6s infinite; }
+  .thinking .dot { background:var(--tool); animation:pulse .4s infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+  #transcript { height:52vh; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding-right:4px; }
+  .msg { max-width:85%; padding:10px 14px; border-radius:14px; }
+  .msg.kam { background:#232836; align-self:flex-start; border-bottom-left-radius:4px; }
+  .msg.seller { background:#3a1a26; align-self:flex-end; border-bottom-right-radius:4px; }
+  .msg.interim { opacity:.55; font-style:italic; }
+  .msg b { display:block; font-size:11px; color:var(--muted); font-weight:600; }
+  #typed { display:flex; gap:8px; margin-top:10px; } #typed input { flex:1; background:#0f1115; border:1px solid var(--line); color:var(--text); border-radius:8px; padding:8px; }
+  #typed button, .btn { background:#2a2f3a; color:var(--text); border:0; border-radius:8px; padding:8px 12px; cursor:pointer; }
+  #tools { display:flex; flex-direction:column; gap:8px; max-height:30vh; overflow-y:auto; }
+  .tool { border-left:3px solid var(--tool); background:#1d2230; padding:8px 10px; border-radius:6px; font-size:13px; animation:slide .3s ease-out; }
+  .tool code { color:var(--tool); font-weight:600; } .tool .out { color:var(--muted); margin-top:2px; }
+  @keyframes slide { from { opacity:0; transform:translateX(12px); } }
+  #plan { margin-top:16px; display:none; animation:slide .4s ease-out; } #plan.show { display:block; }
+  #plan table { width:100%; border-collapse:collapse; font-size:13px; }
+  #plan td, #plan th { text-align:left; padding:6px 4px; border-bottom:1px solid var(--line); vertical-align:top; }
+  #plan th { color:var(--muted); font-weight:500; }
+  .follow { margin-top:10px; padding:10px; background:#163225; border-radius:8px; font-size:13px; }
+  .empty { color:var(--muted); font-size:13px; }
+  .data { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Mini AI Voice KAM</h1><small>Virtual Key Account Manager · assignment prototype · mock data</small></div>
+  <div class="data">Seller: Sharma Home Decor · Home &amp; Kitchen</div>
+</header>
+<main>
+  <section class="panel">
+    <div id="controls">
+      <button id="call" title="Start call">📞</button>
+      <div id="status"><span class="dot"></span><span id="statusText">Press the green button to call your KAM</span><span class="sub" id="statusSub">Chrome or Edge · allow microphone access</span></div>
+    </div>
+    <div id="transcript"></div>
+    <form id="typed"><input id="typedText" placeholder="(fallback) type instead of speaking" autocomplete="off"><button>Send</button></form>
+  </section>
+  <section>
+    <div class="panel"><h2>Agent activity (live tool calls)</h2><div id="tools"><div class="empty">Tools the agent calls will appear here.</div></div></div>
+    <div class="panel" id="plan">
+      <h2>Action plan</h2>
+      <table><thead><tr><th>Task</th><th>Owner</th><th>Due</th><th>Target KPI</th></tr></thead><tbody id="tasks"></tbody></table>
+      <div id="alerts"></div>
+      <div id="follow"></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let sessionId = null, live = false, busy = false, audio = null;
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null;
+
+function setStatus(mode, text, sub = "") {
+  $("status").className = mode; $("statusText").textContent = text; $("statusSub").textContent = sub;
+}
+function addMsg(who, text, cls = "") {
+  const el = document.createElement("div");
+  el.className = `msg ${who} ${cls}`;
+  el.innerHTML = `<b>${who === "kam" ? "Kai (KAM)" : "Seller"}</b>`;
+  el.append(text);
+  $("transcript").append(el); $("transcript").scrollTop = 1e9;
+  return el;
+}
+
+// ---------- speech out: ElevenLabs via /tts, else the best browser voice
+function pickVoice() {
+  const vs = speechSynthesis.getVoices();
+  return vs.find(v => /en-IN/i.test(v.lang) && /natural|online/i.test(v.name))
+      || vs.find(v => /en-IN/i.test(v.lang))
+      || vs.find(v => /en-GB|en-US/i.test(v.lang) && /natural|google/i.test(v.name))
+      || vs.find(v => /^en/i.test(v.lang));
+}
+speechSynthesis.onvoiceschanged = pickVoice;
+async function speak(text) {
+  setStatus("speaking", "Kai is speaking…", "click the red button to interrupt");
+  try {
+    const r = await fetch("/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    if (r.status === 200) {
+      audio = new Audio(URL.createObjectURL(await r.blob()));
+      await new Promise(res => { audio.onended = audio.onerror = audio.onpause = res; audio.play().catch(res); });
+      return;
+    }
+  } catch {}
+  await new Promise(res => {
+    const u = new SpeechSynthesisUtterance(text);
+    u.voice = pickVoice(); u.rate = 1.05; u.onend = u.onerror = res;
+    speechSynthesis.speak(u);
+  });
+}
+function stopSpeaking() { speechSynthesis.cancel(); if (audio) { audio.pause(); audio = null; } }
+
+// ---------- speech in: Web Speech API, one utterance per turn
+function listen() {
+  if (!live || busy) return;
+  if (!SR) { setStatus("", "Speech recognition needs Chrome or Edge", "use the text box meanwhile"); return; }
+  rec = new SR(); rec.lang = "en-IN"; rec.interimResults = true; rec.continuous = false;
+  let interim = null, finalText = "";
+  rec.onresult = e => {
+    const t = [...e.results].map(r => r[0].transcript).join("");
+    if (e.results[e.results.length - 1].isFinal) finalText = t;
+    if (!interim) interim = addMsg("seller", "", "interim");
+    interim.lastChild.textContent = t;
+  };
+  rec.onend = () => {
+    if (interim) interim.remove();
+    if (finalText.trim()) send(finalText.trim());
+    else if (live && !busy) listen();  // silence: keep listening
+  };
+  rec.onerror = e => {  // show why speech-to-text failed instead of failing silently
+    if (e.error === "no-speech" || e.error === "aborted") return;
+    endCall();
+    const why = { "not-allowed": "Microphone blocked: click the lock icon in the address bar and allow the mic",
+                  "network": "This browser has no speech service (Opera/Brave). Use Chrome or Edge",
+                  "audio-capture": "No microphone found: check Windows sound settings" }[e.error] || e.error;
+    setStatus("", "Can't hear you", why);
+  };
+  rec.start();
+  setStatus("listening", "Listening…", "speak naturally, pause when you're done");
+}
+
+// ---------- one conversational turn
+async function send(text, show = true) {
+  busy = true;
+  if (show) addMsg("seller", text);
+  setStatus("thinking", "Kai is thinking…");
+  let speech = Promise.resolve();   // spoken lines queue up so they never overlap
+  const say = t => { addMsg("kam", t); if (live) speech = speech.then(() => live && speak(t)); };
+  try {
+    // The server streams one JSON event per line; handle each as soon as it arrives.
+    const r = await fetch("/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, text }) });
+    const reader = r.body.getReader(), decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n"); buffer = lines.pop();
+      for (const line of lines.filter(Boolean)) {
+        const ev = JSON.parse(line);
+        if (ev.type === "session") sessionId = ev.session_id;
+        if (ev.type === "say") say(ev.text);                       // "Let me pull up your account"
+        if (ev.type === "tool") { showTool(ev); renderPlan(ev.plan); setStatus("thinking", "Kai is working…", ev.tool); }
+        if (ev.type === "reply") { renderPlan(ev.plan); if (ev.text) say(ev.text); }
+        if (ev.type === "error") throw new Error(ev.text);
+      }
+    }
+  } catch (e) {
+    busy = false; setStatus("", "Something went wrong", String(e.message || e)); return;
+  }
+  await speech;
+  busy = false;
+  if (live) listen(); else if ($("statusText").textContent !== "Can't hear you") setStatus("", "Call ended");
+}
+
+function summarize(ev) {
+  const o = ev.output;
+  switch (ev.tool) {
+    case "get_seller_metrics": return `Loaded ${o.seller}: orders ${o.last_month.orders} → ${o.this_month.orders}, out-of-stock ${o.last_month.oos_products} → ${o.this_month.oos_products}`;
+    case "diagnose": return `${o.headline} Root cause: ${o.issues[0].issue}.`;
+    case "raise_restock_alert": return `${o.alerts_raised} supplier alert(s): ${o.alerts.map(a => a.name).join(", ")}`;
+    case "create_action_plan": return `${o.created} tasks created`;
+    case "schedule_follow_up": return `Follow-up booked for ${o.when}`;
+    default: return JSON.stringify(o).slice(0, 140);
+  }
+}
+function showTool(ev) {
+  if ($("tools").querySelector(".empty")) $("tools").innerHTML = "";
+  const el = document.createElement("div"); el.className = "tool";
+  const args = Object.keys(ev.input || {}).length ? JSON.stringify(ev.input).slice(0, 90) : "";
+  el.innerHTML = `<code></code>(<span></span>)<div class="out"></div>`;
+  el.querySelector("code").textContent = ev.tool;
+  el.querySelector("span").textContent = args;
+  el.querySelector(".out").textContent = "→ " + summarize(ev);
+  $("tools").prepend(el);
+}
+function renderPlan(p) {
+  if (!p || !(p.tasks || p.follow_up || p.restock_alerts)) return;
+  $("plan").classList.add("show");
+  $("tasks").innerHTML = "";
+  for (const t of p.tasks || []) {
+    const tr = document.createElement("tr");
+    for (const v of [t.title, t.owner, t.due, t.kpi]) { const td = document.createElement("td"); td.textContent = v; tr.append(td); }
+    $("tasks").append(tr);
+  }
+  $("alerts").textContent = p.restock_alerts?.length ? `Restock alerts sent: ${p.restock_alerts.map(a => `${a.name} (${a.supplier})`).join(", ")}` : "";
+  $("alerts").className = p.restock_alerts?.length ? "data" : "";
+  $("follow").innerHTML = "";
+  if (p.follow_up) {
+    const d = document.createElement("div"); d.className = "follow";
+    d.textContent = `📅 Follow-up call: ${p.follow_up.when} · check: ${p.follow_up.kpis.join(" · ")}`;
+    $("follow").append(d);
+  }
+}
+
+// ---------- call button: start / interrupt / end
+function endCall() {
+  live = false; stopSpeaking(); rec?.abort();
+  $("call").classList.remove("live"); $("call").textContent = "📞"; $("call").title = "Start call";
+  setStatus("", "Call ended", "press the green button to call again");
+}
+$("call").onclick = () => {
+  if (!live) {
+    live = true; $("call").classList.add("live"); $("call").textContent = "✋";
+    $("call").title = "Interrupt / end call";
+    send("[call connected]", false);
+  } else if ($("status").className === "speaking") {
+    stopSpeaking();                         // barge-in: stop Kai and listen
+  } else {
+    endCall();
+  }
+};
+$("typed").onsubmit = e => { e.preventDefault(); const t = $("typedText").value.trim(); if (!t || busy) return; $("typedText").value = ""; rec?.abort(); send(t); };
+</script>
+</body>
+</html>
