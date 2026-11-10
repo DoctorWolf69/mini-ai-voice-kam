@@ -1,0 +1,3 @@
+anthropic>=0.109
+fastapi
+uvicorn
