@@ -19,8 +19,11 @@ Open http://127.0.0.1:8000 in **Chrome or Edge**, press the green button, allow 
 > "My sales have dropped significantly this month. I don't understand why. Can you help me?"
 
 - The ✋ button interrupts Kai while it speaks, and ends the call while it listens.
-- Use headphones so the microphone doesn't pick up Kai's voice.
+- Kai replies in Hinglish if you speak Hinglish.
 - `python server.py --check` runs the self-check on the diagnosis and tools (no API calls).
+
+### Sharing a public link
+Set `ACCESS_CODE` in `.env` (and `HOST=0.0.0.0`, plus `PORT` if the platform gives one). Share the link as `https://your-host/?code=YOUR_CODE`. Requests without the code are refused, so strangers can't spend your API credits.
 
 ## How it works
 
