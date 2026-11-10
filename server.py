@@ -71,54 +71,115 @@ SELLER = {
 TODAY = date.today()
 
 
-def diagnose():
-    """Deterministic diagnosis. The LLM explains it; it never does the arithmetic."""
-    lm, tm, d = SELLER["last_month"], SELLER["this_month"], SELLER["detail"]
-    pct = lambda a, b: round((b - a) / a * 100, 1)
-    oos = d["newly_oos_skus"]
-    lost_oos_orders = sum(s["orders_last_month"] - s["orders_this_month"] for s in oos)
-    order_drop = lm["orders"] - tm["orders"]
-    cancels_last = round(lm["orders"] * lm["cancellation_rate"])
-    cancels_this = round(tm["orders"] * tm["cancellation_rate"])
-    unavailable = d["cancellation_reasons"]["this_month"]["item_unavailable"]
-    top = sorted(oos, key=lambda s: -s["orders_last_month"])
-    suppliers = dict(Counter(s["supplier"] for s in oos))
+def pct_change(before, after):
+    """Percent change, or None when there is no 'before' to compare with."""
+    return round((after - before) / before * 100, 1) if before else None
 
-    issues = [
-        {
-            "rank": 1,
+
+def diagnose(data=None):
+    """Deterministic diagnosis. The LLM explains it; it never does the arithmetic.
+
+    Works on any seller data with the same shape: every number, the headline, the root cause
+    and the ranking are computed here. Issues are ranked by the revenue they cost this month.
+    """
+    data = data or SELLER
+    lm, tm, d = data["last_month"], data["this_month"], data.get("detail", {})
+    price = tm["avg_price"]
+    sales_pct, orders_pct, price_pct = (pct_change(lm[k], tm[k]) for k in ("sales", "orders", "avg_price"))
+    order_drop = lm["orders"] - tm["orders"]
+    issues = []
+
+    # 1. Stock-outs: orders lost on products that ran out this month
+    oos = sorted(d.get("newly_oos_skus", []), key=lambda s: -(s["orders_last_month"] - s["orders_this_month"]))
+    lost_oos = sum(max(0, s["orders_last_month"] - s["orders_this_month"]) for s in oos)
+    if lost_oos or tm["oos_products"] > lm["oos_products"]:
+        share = f", {round(lost_oos / order_drop * 100)}% of the {order_drop}-order drop" if order_drop > 0 else ""
+        top3 = [s for s in oos[:3] if s["orders_last_month"] > s["orders_this_month"]]
+        issues.append({
             "issue": "Stock-outs on best sellers",
-            "evidence": f"Out-of-stock products rose {lm['oos_products']} to {tm['oos_products']}. "
-                        f"The {len(oos)} newly out-of-stock SKUs lost {lost_oos_orders} orders, "
-                        f"which is {round(lost_oos_orders / order_drop * 100)}% of the {order_drop}-order drop.",
-            "revenue_impact_inr": lost_oos_orders * tm["avg_price"],
+            "evidence": f"Out-of-stock products went from {lm['oos_products']} to {tm['oos_products']}. "
+                        f"The {len(oos)} products that ran out this month lost {lost_oos} orders{share}.",
+            "revenue_lost_inr": lost_oos * price,
             "restock_first": [{"sku": s["sku"], "name": s["name"], "supplier": s["supplier"],
-                               "orders_lost": s["orders_last_month"] - s["orders_this_month"]} for s in top[:3]],
-            "restock_first_orders_lost_total": sum(s["orders_last_month"] - s["orders_this_month"] for s in top[:3]),
-            "suppliers_affected": suppliers,
-        },
-        {
-            "rank": 2,
-            "issue": "Cancellations up, mostly from unavailable items",
-            "evidence": f"Cancellation rate went {lm['cancellation_rate']:.0%} to {tm['cancellation_rate']:.0%} "
-                        f"({cancels_last} to {cancels_this} orders). {unavailable} of {cancels_this} cancellations "
-                        f"this month were 'item unavailable', up from {d['cancellation_reasons']['last_month']['item_unavailable']}.",
-            "revenue_impact_inr": cancels_this * tm["avg_price"],
-        },
-        {
-            "rank": 3,
-            "issue": "Visibility risk",
-            "evidence": f"Search impressions fell {abs(pct(d['search_impressions']['last_month'], d['search_impressions']['this_month']))}%. "
-                        "Stock-outs and seller-side cancellations usually lower search ranking, so this can get worse next month.",
-        },
-    ]
+                               "orders_lost": s["orders_last_month"] - s["orders_this_month"]} for s in top3],
+            "restock_first_orders_lost_total": sum(s["orders_last_month"] - s["orders_this_month"] for s in top3),
+            "suppliers_affected": dict(Counter(s["supplier"] for s in oos)),
+            "suggested_actions": ["Restock the top products and alert their suppliers",
+                                  "Turn on low-stock alerts or mark items unavailable so new orders aren't cancelled"],
+        })
+
+    # 2. Pricing: a lower price loses revenue on every order; a higher price may cost orders
+    if price_pct is not None and price_pct <= -3:
+        issues.append({
+            "issue": "Lower selling price",
+            "evidence": f"Average price fell from {lm['avg_price']} to {price} rupees ({price_pct}%).",
+            "revenue_lost_inr": (lm["avg_price"] - price) * tm["orders"],
+            "suggested_actions": ["Review recent discounts and restore prices where margin allows"],
+        })
+    elif price_pct is not None and price_pct >= 3 and order_drop > lost_oos:
+        unexplained = order_drop - lost_oos
+        issues.append({
+            "issue": "Higher price may be costing orders",
+            "evidence": f"Average price rose from {lm['avg_price']} to {price} rupees (+{price_pct}%), and "
+                        f"{unexplained} lost orders are not explained by stock-outs.",
+            "revenue_lost_inr": unexplained * price,
+            "suggested_actions": ["Compare prices with similar listings and test a lower price on top products"],
+        })
+
+    # 3. Cancellations: extra orders cancelled because the rate went up
+    rate_up = round((tm["cancellation_rate"] - lm["cancellation_rate"]) * 100, 1)
+    if rate_up >= 1:
+        reasons = d.get("cancellation_reasons", {})
+        top_reason = max(reasons.get("this_month", {"unknown": 0}).items(), key=lambda kv: kv[1])
+        before = reasons.get("last_month", {}).get(top_reason[0], 0)
+        issues.append({
+            "issue": "More cancellations",
+            "evidence": f"Cancellation rate went from {lm['cancellation_rate']:.0%} to {tm['cancellation_rate']:.0%} "
+                        f"({round(lm['orders'] * lm['cancellation_rate'])} to {round(tm['orders'] * tm['cancellation_rate'])} orders). "
+                        f"Top reason this month: {top_reason[0].replace('_', ' ')} ({top_reason[1]}, up from {before}).",
+            "revenue_lost_inr": round(rate_up / 100 * tm["orders"]) * price,
+            "suggested_actions": [f"Fix the main cancellation reason: {top_reason[0].replace('_', ' ')}"],
+        })
+
+    # 4. Visibility: fewer orders on products that stayed in stock, or fewer search impressions
+    other = d.get("other_skus_orders", {})
+    lost_in_stock = max(0, other.get("last_month", 0) - other.get("this_month", 0))
+    imp = d.get("search_impressions", {})
+    imp_pct = pct_change(imp.get("last_month", 0), imp.get("this_month", 0))
+    if lost_in_stock or (imp_pct is not None and imp_pct <= -5):
+        issues.append({
+            "issue": "Lower visibility",
+            "evidence": (f"Search impressions changed {imp_pct}%. " if imp_pct is not None else "")
+                        + f"Products that stayed in stock lost {lost_in_stock} orders.",
+            "revenue_lost_inr": lost_in_stock * price,
+            "suggested_actions": ["Run sponsored listings or deals on top products once they are in stock"],
+        })
+
+    issues.sort(key=lambda i: -i["revenue_lost_inr"])  # biggest money first
+    for n, issue in enumerate(issues, 1):
+        issue["rank"] = n
+
+    # Headline: is this a volume problem, a price problem, or not a problem at all?
+    if sales_pct is None or sales_pct >= 0:
+        headline = f"Sales did not drop (change: {sales_pct}%)."
+    elif price_pct is not None and abs(price_pct) < 3:
+        headline = f"Volume problem, not a pricing problem: price is flat and orders fell {abs(orders_pct)}%."
+    elif orders_pct is not None and orders_pct > -3:
+        headline = f"Price problem: orders held steady but average price fell {abs(price_pct)}%."
+    else:
+        headline = f"Both fewer orders ({orders_pct}%) and a price change ({price_pct}%) moved sales."
+
+    not_the_cause = []
+    if price_pct is not None and abs(price_pct) < 3:
+        not_the_cause.append(f"Pricing (average price {lm['avg_price']} to {price} rupees)")
+    if other and not lost_in_stock:
+        not_the_cause.append(f"Products that stayed in stock ({other.get('this_month')} orders, not down)")
+
     return {
-        "sales_change_pct": pct(lm["sales"], tm["sales"]),
-        "orders_change_pct": pct(lm["orders"], tm["orders"]),
-        "avg_price_change_pct": pct(lm["avg_price"], tm["avg_price"]),
-        "headline": "Volume problem, not a pricing problem: price is flat and sales fell exactly in line with orders.",
-        "root_cause": "Stock-outs on top SKUs. They lose orders directly, cause 'item unavailable' cancellations, and hurt visibility.",
-        "not_the_cause": ["Pricing (avg price flat at ₹500)", f"In-stock SKUs (still {d['other_skus_orders']['this_month']} orders, unchanged)"],
+        "sales_change_pct": sales_pct, "orders_change_pct": orders_pct, "avg_price_change_pct": price_pct,
+        "headline": headline,
+        "root_cause": f"{issues[0]['issue']}: {issues[0]['evidence']}" if issues else "No clear cause in this data.",
+        "not_the_cause": not_the_cause,
         "issues": issues,
     }
 
@@ -292,6 +353,34 @@ if __name__ == "__main__":
         assert len(SELLER["detail"]["newly_oos_skus"]) + SELLER["last_month"]["oos_products"] == 18
         assert sum(SELLER["detail"]["cancellation_reasons"]["this_month"].values()) == round(270 * 0.14)
         assert sum(SELLER["detail"]["cancellation_reasons"]["last_month"].values()) == round(400 * 0.08)
+        assert d["issues"][0]["issue"] == "Stock-outs on best sellers" and d["not_the_cause"]
+
+        # Other scenarios: the diagnosis must follow the data, not the original story
+        import copy
+
+        def variant(last=None, this=None, detail=None):
+            v = copy.deepcopy(SELLER)
+            v["last_month"].update(last or {}); v["this_month"].update(this or {})
+            if detail is not None:
+                v["detail"] = detail
+            return diagnose(v)
+
+        flat = {"orders": 400, "sales": 200000, "oos_products": 5, "cancellation_rate": 0.08}
+        no_detail = {"newly_oos_skus": [], "other_skus_orders": {"last_month": 400, "this_month": 400}}
+        v = variant(this={**flat, "avg_price": 400, "sales": 160000}, detail=no_detail)  # price cut only
+        assert v["headline"].startswith("Price problem") and v["issues"][0]["issue"] == "Lower selling price", v
+        assert v["issues"][0]["revenue_lost_inr"] == 40000
+        v = variant(this={"orders": 450, "sales": 225000, "oos_products": 5, "cancellation_rate": 0.08}, detail=no_detail)
+        assert v["headline"].startswith("Sales did not drop") and v["root_cause"] == "No clear cause in this data."
+        v = variant(this={**flat, "cancellation_rate": 0.30}, detail={})  # cancellations only, no detail at all
+        assert [i["issue"] for i in v["issues"]] == ["More cancellations"]
+        v = variant(this={"orders": 300, "sales": 165000, "avg_price": 550, "oos_products": 5, "cancellation_rate": 0.08},
+                    detail={"newly_oos_skus": [], "other_skus_orders": {"last_month": 400, "this_month": 300}})
+        assert "Higher price may be costing orders" in [i["issue"] for i in v["issues"]]
+        assert "Lower visibility" in [i["issue"] for i in v["issues"]]
+        v = variant(last={"orders": 0, "sales": 0, "avg_price": 0})  # brand-new seller: nothing to compare
+        assert v["sales_change_pct"] is None and v["headline"].startswith("Sales did not drop")
+
         assert {t["name"] for t in TOOLS} == set(TOOL_FUNCS)
         s = {"plan": {}}
         r = TOOL_FUNCS["raise_restock_alert"](s, {"sku_ids": ["HD-101", "NOPE"]})

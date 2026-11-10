@@ -21,6 +21,7 @@ mic → speech-to-text → /chat → Claude ⇄ tools (loop until it answers) �
 A call script: look at the data before talking → one question to confirm the cause → three actions tied to numbers → get agreement → act with tools → spoken summary. Voice rules: word limits per turn, no lists or SKU codes, amounts said the Indian way, Hinglish if the seller uses it. Hard rule: use only numbers returned by tools.
 
 ## Diagnosis (`diagnose()` is plain Python; the model never does arithmetic)
+It checks four causes (stock-outs, pricing, cancellations, visibility), puts a rupee value on each, and ranks them by revenue lost, so it works on any seller's numbers. For this seller:
 1. Sales and orders both −32.5%, average price flat at ₹500 → **volume problem, not pricing**.
 2. The 13 newly out-of-stock products fell from 150 orders to 20. That loss of 130 is **the whole drop** → **root cause: stock-outs on best sellers**.
 3. Cancellations rose 8% → 14%; "item unavailable" went from 6 to 22 → **stock-outs drive the cancellations**.
