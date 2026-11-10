@@ -28,6 +28,7 @@
   .msg.kam { background:#232836; align-self:flex-start; border-bottom-left-radius:4px; }
   .msg.seller { background:#3a1a26; align-self:flex-end; border-bottom-right-radius:4px; }
   .msg.interim { opacity:.55; font-style:italic; }
+  .msg.sys { align-self:center; background:none; color:var(--muted); font-size:12px; padding:2px; }
   .msg b { display:block; font-size:11px; color:var(--muted); font-weight:600; }
   #typed { display:flex; gap:8px; margin-top:10px; } #typed input { flex:1; background:#0f1115; border:1px solid var(--line); color:var(--text); border-radius:8px; padding:8px; }
   #typed button, .btn { background:#2a2f3a; color:var(--text); border:0; border-radius:8px; padding:8px 12px; cursor:pointer; }
@@ -47,7 +48,7 @@
 <body>
 <header>
   <div><h1>Mini AI Voice KAM</h1><small>Virtual Key Account Manager · assignment prototype · mock data</small></div>
-  <div class="data">Seller: Sharma Home Decor · Home &amp; Kitchen</div>
+  <div class="data" id="seller">Seller account</div>
 </header>
 <main>
   <section class="panel">
@@ -70,9 +71,12 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let sessionId = null, live = false, busy = false, audio = null;
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null;
+const ACCESS_CODE = new URLSearchParams(location.search).get("code") || "";  // only needed on a shared link
+let sessionId = null, live = false, busy = false;
+let audio = null, rec = null;
+let turn = null;          // AbortController for the request in flight, so ending the call cancels it
+let skipSpeech = false;   // set by the interrupt button: drop the rest of Kai's queued lines this turn
 
 function setStatus(mode, text, sub = "") {
   $("status").className = mode; $("statusText").textContent = text; $("statusSub").textContent = sub;
@@ -80,10 +84,14 @@ function setStatus(mode, text, sub = "") {
 function addMsg(who, text, cls = "") {
   const el = document.createElement("div");
   el.className = `msg ${who} ${cls}`;
-  el.innerHTML = `<b>${who === "kam" ? "Kai (KAM)" : "Seller"}</b>`;
+  if (who !== "sys") { const b = document.createElement("b"); b.textContent = who === "kam" ? "Kai (KAM)" : "Seller"; el.append(b); }
   el.append(text);
   $("transcript").append(el); $("transcript").scrollTop = 1e9;
   return el;
+}
+function api(path, body, signal) {
+  return fetch(path, { method: "POST", signal, body: JSON.stringify(body),
+                       headers: { "Content-Type": "application/json", "X-Access-Code": ACCESS_CODE } });
 }
 
 // ---------- speech out: ElevenLabs via /tts, else the best browser voice
@@ -95,16 +103,22 @@ function pickVoice() {
       || vs.find(v => /^en/i.test(v.lang));
 }
 speechSynthesis.onvoiceschanged = pickVoice;
-async function speak(text) {
-  setStatus("speaking", "Kai is speaking…", "click the red button to interrupt");
+// Start fetching the audio as soon as the text arrives, so it's ready by the time it's this line's turn to play.
+async function fetchAudio(text) {
   try {
-    const r = await fetch("/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
-    if (r.status === 200) {
-      audio = new Audio(URL.createObjectURL(await r.blob()));
-      await new Promise(res => { audio.onended = audio.onerror = audio.onpause = res; audio.play().catch(res); });
-      return;
-    }
-  } catch {}
+    const r = await api("/tts", { text });
+    return r.status === 200 ? URL.createObjectURL(await r.blob()) : null;
+  } catch { return null; }
+}
+async function speak(text, audioUrl) {
+  setStatus("speaking", "Kai is speaking…", "click the red button to interrupt");
+  const url = await audioUrl;
+  if (skipSpeech || !live) return;
+  if (url) {
+    audio = new Audio(url);
+    await new Promise(res => { audio.onended = audio.onerror = audio.onpause = res; audio.play().catch(res); });
+    return;
+  }
   await new Promise(res => {
     const u = new SpeechSynthesisUtterance(text);
     u.voice = pickVoice(); u.rate = 1.05; u.onend = u.onerror = res;
@@ -144,14 +158,21 @@ function listen() {
 
 // ---------- one conversational turn
 async function send(text, show = true) {
-  busy = true;
+  busy = true; skipSpeech = false;
+  turn = new AbortController();
   if (show) addMsg("seller", text);
   setStatus("thinking", "Kai is thinking…");
   let speech = Promise.resolve();   // spoken lines queue up so they never overlap
-  const say = t => { addMsg("kam", t); if (live) speech = speech.then(() => live && speak(t)); };
+  const say = t => {
+    addMsg("kam", t);
+    if (!live) return;
+    const audioUrl = fetchAudio(t);  // prefetch now, play when it's this line's turn
+    speech = speech.then(() => live && !skipSpeech && speak(t, audioUrl));
+  };
   try {
     // The server streams one JSON event per line; handle each as soon as it arrives.
-    const r = await fetch("/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, text }) });
+    const r = await api("/chat", { session_id: sessionId, text }, turn.signal);
+    if (!r.ok) throw new Error(r.status === 401 ? "Access code missing or wrong: open the full link you were given" : `Server error ${r.status}`);
     const reader = r.body.getReader(), decoder = new TextDecoder();
     let buffer = "";
     while (true) {
@@ -161,7 +182,7 @@ async function send(text, show = true) {
       const lines = buffer.split("\n"); buffer = lines.pop();
       for (const line of lines.filter(Boolean)) {
         const ev = JSON.parse(line);
-        if (ev.type === "session") sessionId = ev.session_id;
+        if (ev.type === "session") { sessionId = ev.session_id; if (ev.seller) $("seller").textContent = `Seller: ${ev.seller}`; }
         if (ev.type === "say") say(ev.text);                       // "Let me pull up your account"
         if (ev.type === "tool") { showTool(ev); renderPlan(ev.plan); setStatus("thinking", "Kai is working…", ev.tool); }
         if (ev.type === "reply") { renderPlan(ev.plan); if (ev.text) say(ev.text); }
@@ -169,7 +190,9 @@ async function send(text, show = true) {
       }
     }
   } catch (e) {
-    busy = false; setStatus("", "Something went wrong", String(e.message || e)); return;
+    if (e.name === "AbortError") { busy = false; return; }  // the call was ended mid-turn
+    addMsg("sys", `Problem: ${e.message || e}`);
+    say("Sorry, something went wrong on my side. Could you say that again?");  // recover instead of going silent
   }
   await speech;
   busy = false;
@@ -178,11 +201,12 @@ async function send(text, show = true) {
 
 function summarize(ev) {
   const o = ev.output;
+  if (o.error) return `error: ${o.error}`;
   switch (ev.tool) {
     case "get_seller_metrics": return `Loaded ${o.seller}: orders ${o.last_month.orders} → ${o.this_month.orders}, out-of-stock ${o.last_month.oos_products} → ${o.this_month.oos_products}`;
-    case "diagnose": return `${o.headline} Root cause: ${o.issues[0].issue}.`;
+    case "diagnose": return o.issues.length ? `${o.headline} Top issue: ${o.issues[0].issue}.` : o.headline;
     case "raise_restock_alert": return `${o.alerts_raised} supplier alert(s): ${o.alerts.map(a => a.name).join(", ")}`;
-    case "create_action_plan": return `${o.created} tasks created`;
+    case "create_action_plan": return `${o.added} task(s) added, ${o.tasks.length} in plan`;
     case "schedule_follow_up": return `Follow-up booked for ${o.when}`;
     default: return JSON.stringify(o).slice(0, 140);
   }
@@ -217,21 +241,24 @@ function renderPlan(p) {
 }
 
 // ---------- call button: start / interrupt / end
+function startCall() {
+  // Every call starts fresh: new session on the server, empty transcript, panel and plan.
+  sessionId = null;
+  $("transcript").innerHTML = "";
+  $("tools").innerHTML = '<div class="empty">Tools the agent calls will appear here.</div>';
+  $("plan").classList.remove("show"); $("tasks").innerHTML = ""; $("alerts").textContent = ""; $("follow").innerHTML = "";
+  live = true; $("call").classList.add("live"); $("call").textContent = "✋"; $("call").title = "Interrupt / end call";
+  send("[call connected]", false);
+}
 function endCall() {
-  live = false; stopSpeaking(); rec?.abort();
+  live = false; turn?.abort(); stopSpeaking(); rec?.abort();
   $("call").classList.remove("live"); $("call").textContent = "📞"; $("call").title = "Start call";
   setStatus("", "Call ended", "press the green button to call again");
 }
 $("call").onclick = () => {
-  if (!live) {
-    live = true; $("call").classList.add("live"); $("call").textContent = "✋";
-    $("call").title = "Interrupt / end call";
-    send("[call connected]", false);
-  } else if ($("status").className === "speaking") {
-    stopSpeaking();                         // barge-in: stop Kai and listen
-  } else {
-    endCall();
-  }
+  if (!live) startCall();
+  else if ($("status").className === "speaking") { skipSpeech = true; stopSpeaking(); }  // interrupt: skip all queued lines
+  else endCall();
 };
 $("typed").onsubmit = e => { e.preventDefault(); const t = $("typedText").value.trim(); if (!t || busy) return; $("typedText").value = ""; rec?.abort(); send(t); };
 </script>
