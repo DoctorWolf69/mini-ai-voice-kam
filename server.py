@@ -1,6 +1,6 @@
 """Mini AI Voice KAM: FastAPI backend.
 
-Browser does speech-to-text (Web Speech API) and sends text to /chat.
+Browser does speech-to-text (Web Speech API, improved by /stt) and sends text to /chat.
 Here Claude runs a tool loop over mock seller data and streams each step back as it happens.
 /tts turns the reply into speech.
 """
@@ -16,7 +16,8 @@ from datetime import date, datetime, timedelta
 
 import anthropic
 import uvicorn
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -391,6 +392,36 @@ def tts(body: TTS, x_access_code: str = Header("")):
             return Response(r.read(), media_type="audio/mpeg")
     except Exception:
         return Response(status_code=204)  # fall back to browser voice
+
+
+def elevenlabs_transcribe(audio, content_type, key):
+    """Sends the recorded audio to ElevenLabs Scribe and returns the text."""
+    boundary = uuid.uuid4().hex
+    model = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="model_id"\r\n\r\n{model}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="speech"\r\n'
+            f'Content-Type: {content_type}\r\n\r\n').encode() + audio + f'\r\n--{boundary}--\r\n'.encode()
+    req = urllib.request.Request("https://api.elevenlabs.io/v1/speech-to-text", data=body, headers={
+        "xi-api-key": key, "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r).get("text", "").strip()
+
+
+@app.post("/stt")
+async def stt(request: Request, x_access_code: str = Header("")):
+    """More accurate speech-to-text. The page records each utterance and sends the audio here.
+    Returns {"text": ...}, or 204 so the page keeps the browser's own transcript."""
+    if not allowed(x_access_code):
+        return Response(status_code=401)
+    key = os.environ.get("ELEVENLABS_API_KEY")
+    audio = await request.body()
+    if not key or not audio or len(audio) > 5_000_000:  # 5 MB is minutes of speech; one turn is far less
+        return Response(status_code=204)
+    try:
+        text = await run_in_threadpool(elevenlabs_transcribe, audio, request.headers.get("content-type", "audio/webm"), key)
+    except Exception:
+        return Response(status_code=204)
+    return {"text": text} if text else Response(status_code=204)
 
 
 if __name__ == "__main__":

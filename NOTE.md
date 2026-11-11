@@ -5,14 +5,14 @@
 ## Stack
 | Layer | Choice | Why |
 |---|---|---|
-| Speech-to-text | Browser Web Speech API (`en-IN`) | Zero setup, low latency, handles Indian English |
+| Speech-to-text | ElevenLabs Scribe, with the browser's Web Speech API for live words and end-of-turn detection | The browser alone misheard Indian names; Scribe gets them right, and the browser is the fallback |
 | Model | Claude Haiku 5.5 with tool use | Fast enough for voice; one env var switches to Sonnet 5.5 |
 | Text-to-speech | ElevenLabs Flash v2.5, browser voice as fallback | Natural voice that never goes silent |
 | App | FastAPI backend + one HTML page | Keys stay on the server |
 
 ## Workflow
 ```
-mic → speech-to-text → /chat → Claude ⇄ tools (loop until it answers) → /tts → speaker → listen again
+mic → browser STT (live) + Scribe (/stt, accurate) → /chat → Claude ⇄ tools (loop until it answers) → /tts → speaker → listen again
          tools: get_seller_metrics · diagnose · raise_restock_alert · create_action_plan · schedule_follow_up
 ```
 `/chat` streams each step to the browser as it happens. The seller hears "let me pull up your account" and sees each tool run while the model is still working, so there is no dead air. Kai listens again as soon as it stops speaking, and the ✋ button interrupts it.

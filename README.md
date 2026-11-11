@@ -10,7 +10,7 @@ Built for the "Mini AI Voice KAM" take-home assignment. All seller data is mock 
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env      # add ANTHROPIC_API_KEY (ELEVENLABS_API_KEY is optional)
+cp .env.example .env      # add ANTHROPIC_API_KEY; ELEVENLABS_API_KEY (optional) needs Text to Speech and Speech to Text
 python server.py
 ```
 
@@ -28,12 +28,12 @@ Set `ACCESS_CODE` in `.env` (and `HOST=0.0.0.0`, plus `PORT` if the platform giv
 ## How it works
 
 ```
-mic → Web Speech API (speech-to-text) → POST /chat → Claude + tools → reply → /tts (ElevenLabs) → speaker
+mic → Web Speech API (live words, end of turn) + /stt (ElevenLabs Scribe, accurate text) → POST /chat → Claude + tools → reply → /tts (ElevenLabs) → speaker
 ```
 
 | File | What it is |
 |---|---|
-| `server.py` | FastAPI app: mock seller data, the five tools, the Claude tool loop, `/chat` (streams events) and `/tts` |
+| `server.py` | FastAPI app: mock seller data, the five tools, the Claude tool loop, `/chat` (streams events), `/stt` and `/tts` |
 | `prompt.md` | System prompt: call flow, rules for numbers, voice style |
 | `index.html` | The whole UI: speech in and out, transcript, live tool panel, action-plan card |
 | `NOTE.md` | One-page design note: models, workflow, diagnosis logic, assumptions, next steps |

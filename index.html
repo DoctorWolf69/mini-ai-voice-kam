@@ -34,6 +34,7 @@
   #typed button, .btn { background:#2a2f3a; color:var(--text); border:0; border-radius:8px; padding:8px 12px; cursor:pointer; }
   #tools { display:flex; flex-direction:column; gap:8px; max-height:30vh; overflow-y:auto; }
   .tool { border-left:3px solid var(--tool); background:#1d2230; padding:8px 10px; border-radius:6px; font-size:13px; animation:slide .3s ease-out; }
+  .tool { overflow-wrap:anywhere; }  /* long tool inputs wrap instead of scrolling sideways */
   .tool code { color:var(--tool); font-weight:600; } .tool .out { color:var(--muted); margin-top:2px; }
   @keyframes slide { from { opacity:0; transform:translateX(12px); } }
   #plan { margin-top:16px; display:none; animation:slide .4s ease-out; } #plan.show { display:block; }
@@ -75,6 +76,7 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const ACCESS_CODE = new URLSearchParams(location.search).get("code") || "";  // only needed on a shared link
 let sessionId = null, live = false, busy = false;
 let audio = null, rec = null;
+let micStream = null;     // microphone, also recorded so /stt can produce a more accurate transcript
 let turn = null;          // AbortController for the request in flight, so ending the call cancels it
 let skipSpeech = false;   // set by the interrupt button: drop the rest of Kai's queued lines this turn
 
@@ -127,22 +129,51 @@ async function speak(text, audioUrl) {
 }
 function stopSpeaking() { speechSynthesis.cancel(); if (audio) { audio.pause(); audio = null; } }
 
-// ---------- speech in: Web Speech API, one utterance per turn
+// ---------- speech in
+// The browser's Web Speech API detects when the seller has finished and shows words live.
+// At the same time the audio is recorded; when the seller stops, it goes to /stt (ElevenLabs Scribe),
+// which is more accurate with Indian accents. If /stt isn't available, the browser's text is used.
+async function transcribe(blob) {
+  if (blob.size < 2000) return null;  // too short to be speech
+  const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch("/stt", { method: "POST", body: blob, signal: ctrl.signal,
+                                    headers: { "Content-Type": blob.type || "audio/webm", "X-Access-Code": ACCESS_CODE } });
+    if (r.status !== 200) return null;
+    const text = ((await r.json()).text || "").trim();
+    return /[\u0900-\u097F]/.test(text) ? null : text;  // Hindi script: keep the browser's Hinglish in English letters
+  } catch { return null; } finally { clearTimeout(timer); }
+}
 function listen() {
   if (!live || busy) return;
   if (!SR) { setStatus("", "Speech recognition needs Chrome or Edge", "use the text box meanwhile"); return; }
   rec = new SR(); rec.lang = "en-IN"; rec.interimResults = true; rec.continuous = false;
-  let interim = null, finalText = "";
+  let interim = null, finalText = "", chunks = [];
+  const recorder = micStream && window.MediaRecorder ? new MediaRecorder(micStream) : null;
+  if (recorder) { recorder.ondataavailable = e => chunks.push(e.data); recorder.start(); }
+  const stopRecording = () => new Promise(res => {
+    if (!recorder || recorder.state === "inactive") return res();
+    recorder.onstop = res; recorder.stop();
+  });
   rec.onresult = e => {
     const t = [...e.results].map(r => r[0].transcript).join("");
     if (e.results[e.results.length - 1].isFinal) finalText = t;
     if (!interim) interim = addMsg("seller", "", "interim");
     interim.lastChild.textContent = t;
   };
-  rec.onend = () => {
+  rec.onend = async () => {
+    await stopRecording();
+    if (!finalText.trim()) {           // silence: keep listening
+      if (interim) interim.remove();
+      if (live && !busy) listen();
+      return;
+    }
+    busy = true;                       // block the text box while the better transcript is fetched
+    setStatus("thinking", "Got it…");
+    const better = recorder ? await transcribe(new Blob(chunks, { type: recorder.mimeType })) : null;
     if (interim) interim.remove();
-    if (finalText.trim()) send(finalText.trim());
-    else if (live && !busy) listen();  // silence: keep listening
+    busy = false;
+    if (live) send(better || finalText.trim());
   };
   rec.onerror = e => {  // show why speech-to-text failed instead of failing silently
     if (e.error === "no-speech" || e.error === "aborted") return;
@@ -241,17 +272,21 @@ function renderPlan(p) {
 }
 
 // ---------- call button: start / interrupt / end
-function startCall() {
+async function startCall() {
   // Every call starts fresh: new session on the server, empty transcript, panel and plan.
   sessionId = null;
+  live = true;
+  try { micStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch { micStream = null; }  // no recording: the browser's own transcript is used
   $("transcript").innerHTML = "";
   $("tools").innerHTML = '<div class="empty">Tools the agent calls will appear here.</div>';
   $("plan").classList.remove("show"); $("tasks").innerHTML = ""; $("alerts").textContent = ""; $("follow").innerHTML = "";
-  live = true; $("call").classList.add("live"); $("call").textContent = "✋"; $("call").title = "Interrupt / end call";
+  $("call").classList.add("live"); $("call").textContent = "✋"; $("call").title = "Interrupt / end call";
   send("[call connected]", false);
 }
 function endCall() {
   live = false; turn?.abort(); stopSpeaking(); rec?.abort();
+  micStream?.getTracks().forEach(t => t.stop()); micStream = null;  // release the microphone
   $("call").classList.remove("live"); $("call").textContent = "📞"; $("call").title = "Start call";
   setStatus("", "Call ended", "press the green button to call again");
 }
