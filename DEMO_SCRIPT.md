@@ -22,7 +22,7 @@ Click on the Chrome window first (Game Bar records the active window), then **Wi
 | 1 | Wait 2 seconds on the empty page, then press the green 📞. Kai greets you. | (nothing) |
 | 2 | "Listening…" appears. | **"Hi Kai. My sales have dropped significantly this month. I don't understand why. Can you help me?"** |
 | 3 | Kai says "let me pull up your account"; `get_seller_metrics` and `diagnose` appear in the panel. Kai explains: stock-outs, not pricing, and asks why items ran out. | **"Yes, my supplier Jaipur Textiles delayed the last shipment, and I didn't notice how many items had run out."** |
-| 4 | Kai recommends three actions and asks "Shall I set this up for you?" | **"Yes, please set it up."** |
+| 4 | Kai recommends three actions and asks "Shall I set this up for you?" | **"Yes, go ahead."** (clearer than "set it up", which can be misheard as "shut up") |
 | 5 | `raise_restock_alert`, `create_action_plan`, `schedule_follow_up` appear; the action-plan card fills in. Kai gives the summary and says goodbye. | **"Thanks, Kai."** |
 | 6 | Wait 3 seconds on the finished screen (plan card visible), then **Win+Alt+R** to stop. | (nothing) |
 
