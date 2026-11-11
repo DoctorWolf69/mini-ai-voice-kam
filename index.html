@@ -34,6 +34,7 @@
   #typed button, .btn { background:#2a2f3a; color:var(--text); border:0; border-radius:8px; padding:8px 12px; cursor:pointer; }
   #tools { display:flex; flex-direction:column; gap:8px; max-height:30vh; overflow-y:auto; }
   .tool { border-left:3px solid var(--tool); background:#1d2230; padding:8px 10px; border-radius:6px; font-size:13px; animation:slide .3s ease-out; }
+  .tool { overflow-wrap:anywhere; }  /* long tool inputs wrap instead of scrolling sideways */
   .tool code { color:var(--tool); font-weight:600; } .tool .out { color:var(--muted); margin-top:2px; }
   @keyframes slide { from { opacity:0; transform:translateX(12px); } }
   #plan { margin-top:16px; display:none; animation:slide .4s ease-out; } #plan.show { display:block; }
